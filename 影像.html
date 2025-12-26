@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>翊華AI程式班 - 手部體感遊戲 (極速判定版)</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+  <script src="https://unpkg.com/ml5@1/dist/ml5.min.js"></script>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      font-family: 'Microsoft JhengHei', sans-serif;
+    }
+    canvas {
+      border: 4px solid #333;
+      box-shadow: 0 0 30px rgba(0, 255, 0, 0.3);
+      border-radius: 12px;
+    }
+  </style>
+</head>
+<body>
+<script>
+  let video;
+  let handPose;
+  let hands = [];
+  
+  // 記錄上一幀的手指位置，用於計算連續碰撞
+  let prevHandPositions = { "Left": null, "Right": null };
+
+  const COLORS = {
+    "Left": { r: 0, g: 255, b: 255 },   // 藍隊 (Cyan)
+    "Right": { r: 255, g: 40, b: 60 }   // 紅隊 (Red)
+  };
+
+  let balls = [];
+  let particles = []; // 恢復粒子陣列
+  let scores = { blue: 0, red: 0 };
+
+  function preload() {
+    handPose = ml5.handPose({ maxHands: 2, flipped: true });
+  }
+
+  function setup() {
+    createCanvas(640, 480);
+    video = createCapture(VIDEO);
+    video.size(640, 480);
+    video.hide();
+    handPose.detectStart(video, gotHands);
+  }
+
+  function draw() {
+    background(20);
+
+    // 1. 繪製視訊
+    push();
+    translate(width, 0);
+    scale(-1, 1);
+    tint(120, 120); 
+    image(video, 0, 0, width, height);
+    pop();
+
+    // 2. 處理手部邏輯 (粒子 + 碰撞)
+    updateHandLogic();
+    
+    // 3. 繪製粒子 (疊加發光模式)
+    blendMode(ADD);
+    for (let i = particles.length - 1; i >= 0; i--) {
+      let p = particles[i];
+      p.update();
+      p.show();
+      if (p.isDead()) particles.splice(i, 1);
+    }
+    blendMode(BLEND);
+
+    // 4. 更新球體與 UI
+    updateBalls();
+    drawUI();
+  }
+
+  function gotHands(results) {
+    hands = results;
+  }
+
+  function updateHandLogic() {
+    // 每一幀先重置「當前幀有沒有偵測到手」的標記，
+    // 如果這幀沒手，要清除 prevPosition 以免下一幀手突然出現時產生超長切割線
+    let currentFrameHands = { "Left": false, "Right": false };
+
+    for (let hand of hands) {
+      // 左右手校正
+      let finalHandedness = hand.handedness === "Left" ? "Right" : "Left";
+      currentFrameHands[finalHandedness] = true;
+
+      let indexFinger = hand.index_finger_tip;
+      let x = width - indexFinger.x; 
+      let y = indexFinger.y;
+
+      // --- 1. 產生手部拖尾粒子 (Hand Trails) ---
+      let col = COLORS[finalHandedness];
+      for(let k=0; k<4; k++){ // 粒子數量增加，讓軌跡更明顯
+         particles.push(new Particle(x, y, color(col.r, col.g, col.b), "TRAIL"));
+      }
+
+      // --- 2. 碰撞偵測 (極速判定優化) ---
+      // 取得上一幀該手的位置
+      let prev = prevHandPositions[finalHandedness];
+      
+      if (prev) {
+        // 如果有上一幀的位置，進行「線段」碰撞偵測 (Raycasting)
+        // 這能捕捉到兩幀之間快速移動的路徑
+        checkSlicingLine(prev.x, prev.y, x, y);
+      } else {
+        // 如果是剛出現的第一幀，只檢查「點」
+        checkSlicingPoint(x, y);
+      }
+
+      // 更新上一幀位置為當前位置
+      prevHandPositions[finalHandedness] = { x: x, y: y };
+    }
+
+    // 如果某隻手移出了畫面，清除它的上一幀紀錄
+    if (!currentFrameHands["Left"]) prevHandPositions["Left"] = null;
+    if (!currentFrameHands["Right"]) prevHandPositions["Right"] = null;
+  }
+
+  // --- 新增：線段碰撞偵測 (解決揮動過快導致的判定遺失) ---
+  function checkSlicingLine(x1, y1, x2, y2) {
+    for (let i = balls.length - 1; i >= 0; i--) {
+      let b = balls[i];
+      
+      // 計算球心到線段的最短距離
+      let hit = lineCircleCollision(x1, y1, x2, y2, b.x, b.y, b.size / 2 + 15); // +15 增加容錯率
+      
+      if (hit) {
+        processHit(b, i);
+      }
+    }
+  }
+
+  // 備用：單點碰撞偵測
+  function checkSlicingPoint(x, y) {
+    for (let i = balls.length - 1; i >= 0; i--) {
+      let b = balls[i];
+      if (dist(x, y, b.x, b.y) < b.size / 2 + 15) {
+        processHit(b, i);
+      }
+    }
+  }
+
+  // 處理命中邏輯
+  function processHit(b, index) {
+    // 得分邏輯
+    if (!b.isSplitChild) {
+      if (b.type === "RED") scores.red += 10;
+      else scores.blue += 10;
+      
+      splitBall(b); // 分裂
+    } else {
+      // 切到小球也給一點點打擊特效
+      spawnExplosion(b.x, b.y, b.color, 5);
+    }
+    
+    // 從陣列移除
+    balls.splice(index, 1);
+  }
+
+  // --- 數學運算：線段與圓形的碰撞 ---
+  function lineCircleCollision(x1, y1, x2, y2, cx, cy, r) {
+    // 計算線段長度 squared
+    let lenSq = (x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2);
+    
+    // 如果兩點重合，退化成點碰撞
+    if (lenSq === 0) return dist(x1, y1, cx, cy) < r;
+
+    // 計算投影點 t
+    let dot = ((cx - x1) * (x2 - x1) + (cy - y1) * (y2 - y1)) / lenSq;
+    
+    // 限制 t 在線段範圍內 [0, 1]
+    let t = Math.max(0, Math.min(1, dot));
+    
+    // 找出線段上離圓心最近的點
+    let closestX = x1 + t * (x2 - x1);
+    let closestY = y1 + t * (y2 - y1);
+    
+    // 檢查距離
+    return dist(closestX, closestY, cx, cy) < r;
+  }
+
+  function splitBall(parentBall) {
+    let newSize = parentBall.size * 0.6;
+    
+    // 產生打擊火花 (增加手感)
+    spawnExplosion(parentBall.x, parentBall.y, parentBall.color, 15);
+
+    // 產生兩顆小球
+    balls.push(new Ball(parentBall.x, parentBall.y, newSize, parentBall.type, parentBall.vx - 4, parentBall.vy - 3, true));
+    balls.push(new Ball(parentBall.x, parentBall.y, newSize, parentBall.type, parentBall.vx + 4, parentBall.vy - 3, true));
+  }
+  
+  function spawnExplosion(x, y, col, count) {
+    for(let i=0; i<count; i++) {
+       particles.push(new Particle(x, y, col, "EXPLOSION"));
+    }
+  }
+
+  function updateBalls() {
+    if (frameCount % 45 === 0) balls.push(new Ball());
+    for (let i = balls.length - 1; i >= 0; i--) {
+      let b = balls[i];
+      b.update();
+      b.show();
+      if (b.offScreen()) balls.splice(i, 1);
+    }
+  }
+
+  function drawUI() {
+    textSize(32); textStyle(BOLD);
+    
+    // 藍隊
+    textAlign(LEFT, TOP); stroke(0); strokeWeight(4);
+    fill(COLORS.Left.r, COLORS.Left.g, COLORS.Left.b);
+    text(`BLUE: ${scores.blue}`, 20, 20);
+    
+    // 紅隊
+    textAlign(RIGHT, TOP); stroke(0); strokeWeight(4);
+    fill(COLORS.Right.r, COLORS.Right.g, COLORS.Right.b);
+    text(`RED: ${scores.red}`, width - 20, 20);
+
+    // 標題
+    textAlign(CENTER, BOTTOM); textSize(28); 
+    stroke(0); strokeWeight(5); fill(0, 255, 0);
+    text("翊華AI程式班-手部體感遊戲", width / 2, height - 15);
+  }
+
+  // --- 類別定義 ---
+  class Ball {
+    constructor(x, y, size, type, vx, vy, isChild = false) {
+      if (x === undefined) {
+        this.x = random(60, width - 60);
+        this.y = height + 50;
+        this.size = 75;
+        this.vx = random(-2, 2);
+        this.vy = random(-11, -14);
+        if (random() > 0.5) { this.type = "RED"; this.color = color(255, 40, 60); } 
+        else { this.type = "BLUE"; this.color = color(0, 200, 255); }
+        this.isSplitChild = false;
+      } else {
+        this.x = x; this.y = y; this.size = size; this.type = type;
+        this.color = type === "RED" ? color(255, 40, 60) : color(0, 200, 255);
+        this.vx = vx; this.vy = vy;
+        this.isSplitChild = true;
+      }
+      this.gravity = 0.25;
+    }
+    update() { this.x += this.vx; this.y += this.vy; this.vy += this.gravity; }
+    show() {
+      noStroke(); fill(this.color); circle(this.x, this.y, this.size);
+      fill(255, 255, 255, 150); circle(this.x - this.size/4, this.y - this.size/4, this.size/4);
+    }
+    offScreen() { return this.y > height + 60 || this.x < -50 || this.x > width + 50; }
+  }
+
+  // 粒子類別 (手部軌跡 + 爆炸)
+  class Particle {
+    constructor(x, y, col, type) {
+      this.x = x; this.y = y; this.color = col; this.type = type;
+      if (type === "TRAIL") {
+        this.vx = random(-1, 1); this.vy = random(-1, 1);
+        this.size = random(5, 12); this.life = 10; this.decay = 2.5; // 軌跡消失快一點
+      } else { // EXPLOSION
+        this.vx = random(-5, 5); this.vy = random(-5, 5);
+        this.size = random(5, 15); this.life = 30; this.decay = 2;
+      }
+    }
+    update() { this.x += this.vx; this.y += this.vy; this.life -= this.decay; }
+    show() {
+      noStroke();
+      let a = map(this.life, 0, 30, 0, 255);
+      fill(red(this.color), green(this.color), blue(this.color), a);
+      circle(this.x, this.y, this.size);
+    }
+    isDead() { return this.life < 0; }
+  }
+</script>
+</body>
+</html>
